@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -55,5 +56,31 @@ int util_daemonize(void) {
 	open("/dev/null", O_RDONLY);
 	open("/dev/null", O_WRONLY);
 	open("/dev/null", O_WRONLY);
+	return 0;
+}
+
+int util_random_bytes(void *buf, uint32_t len) {
+	int fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0) {
+		return -1;
+	}
+	uint8_t *p = (uint8_t *)buf;
+	uint32_t off = 0;
+	while (off < len) {
+		ssize_t n = read(fd, p + off, (size_t)(len - off));
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			close(fd);
+			return -1;
+		}
+		if (n == 0) {
+			close(fd);
+			return -1;
+		}
+		off += (uint32_t)n;
+	}
+	close(fd);
 	return 0;
 }

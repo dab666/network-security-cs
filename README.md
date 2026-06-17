@@ -20,5 +20,5 @@ Linux 环境下的 C 语言课设代码仓库，用于逐阶段实现：
 cd stage1_dh
 make
 ./bin/server --host 0.0.0.0 --port 9000
-./bin/client --host 127.0.0.1 --port 9000 --message "hello"
+./bin/client --host 127.0.0.1 --port 9000 --message "hello" --count 3 --rekey-every 1
 ```

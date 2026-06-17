@@ -8,12 +8,17 @@
 
 本目录当前提供：
 
-- 与阶段 1 同风格的项目骨架（便于替换/扩展握手协议）
+- 改进握手：引入服务端长期静态 DH 密钥对进行身份认证（不需要写死共享密码）
+- 会话密钥派生同时包含：
+  - 临时 DH（前向安全）
+  - 静态-临时 DH（认证，抵御 MITM）
+- AES-256-GCM 加密传输与客户端可触发的周期性 rekey
 
 ## 构建与运行
 
 ```bash
 make
-./bin/server --host 0.0.0.0 --port 9000
-./bin/client --host 127.0.0.1 --port 9000 --message "hello"
+./bin/keygen --priv server_static.key --pub server_static.pub
+./bin/server --host 0.0.0.0 --port 9100 --static-key server_static.key
+./bin/client --host 127.0.0.1 --port 9100 --server-pub server_static.pub --message "hello" --count 3 --rekey-every 1
 ```

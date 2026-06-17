@@ -20,3 +20,6 @@ bin/
 *.swo
 
 nohup.out
+
+server_static.key
+server_static.pub

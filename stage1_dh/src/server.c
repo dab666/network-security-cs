@@ -1,4 +1,5 @@
 #include "net.h"
+#include "sc.h"
 #include "util.h"
 
 #include <getopt.h>
@@ -7,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 struct worker_args {
@@ -18,17 +20,24 @@ static void *worker_main(void *arg) {
 	int fd = wa->fd;
 	free(wa);
 
+	struct sc_session s;
+	memset(&s, 0, sizeof(s));
+	if (sc_server_handshake(fd, &s) != 0) {
+		close(fd);
+		return NULL;
+	}
+
 	for (;;) {
-		void *buf = NULL;
-		uint32_t len = 0;
-		if (net_recv_frame(fd, &buf, &len) != 0) {
+		uint8_t *pt = NULL;
+		uint32_t pt_len = 0;
+		if (sc_recv_data(fd, &s, &pt, &pt_len) != 0) {
 			break;
 		}
-		if (net_send_frame(fd, buf, len) != 0) {
-			net_free_frame(buf);
+		if (sc_send_data(fd, &s, pt, pt_len) != 0) {
+			free(pt);
 			break;
 		}
-		net_free_frame(buf);
+		free(pt);
 	}
 
 	close(fd);
