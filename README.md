@@ -14,12 +14,11 @@ Linux 环境下的 C 语言课设代码仓库，用于逐阶段实现：
 
 每个阶段目录都是一个可独立编译运行的小项目（各自带 Makefile）。
 
-## 通用运行方式（各阶段目录内）
+## 构建与运行（示例）
 
 ```bash
+cd stage1_dh
 make
 ./bin/server --host 0.0.0.0 --port 9000
 ./bin/client --host 127.0.0.1 --port 9000 --message "hello"
 ```
-
-部分阶段会额外提供 `--daemon` 等参数以支持后台运行。
