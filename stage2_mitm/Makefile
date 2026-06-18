@@ -20,7 +20,7 @@ $(OBJ_DIR):
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) -c $< -o $@
 
-$(MITM): $(OBJ_DIR)/mitm_proxy.o $(OBJ_DIR)/net.o $(OBJ_DIR)/util.o $(OBJ_DIR)/crypto_sha256.o $(OBJ_DIR)/crypto_aes256.o $(OBJ_DIR)/crypto_gcm.o $(OBJ_DIR)/crypto_dh.o | $(BIN_DIR)
+$(MITM): $(OBJ_DIR)/mitm_proxy.o $(OBJ_DIR)/net.o $(OBJ_DIR)/util.o $(OBJ_DIR)/logger.o $(OBJ_DIR)/crypto_sha256.o $(OBJ_DIR)/crypto_aes256.o $(OBJ_DIR)/crypto_gcm.o $(OBJ_DIR)/crypto_dh.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) $^ -o $@ -pthread $(LDFLAGS)
 
 clean:

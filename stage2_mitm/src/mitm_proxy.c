@@ -1,6 +1,7 @@
 #include "crypto_dh.h"
 #include "crypto_gcm.h"
 #include "crypto_sha256.h"
+#include "logger.h"
 #include "net.h"
 #include "util.h"
 
@@ -63,6 +64,7 @@ static void dump_hex(const char *prefix, const uint8_t *buf, size_t len) {
 	}
 	fprintf(stdout, "\n");
 	fflush(stdout);
+	logger_hex(prefix, buf, len);
 }
 
 struct rekey_pending {
@@ -101,6 +103,7 @@ static int relay_raw_one(int from_fd, int to_fd) {
 	if (net_recv_frame(from_fd, &buf, &len) != 0) {
 		return -1;
 	}
+	logger_log("raw relay: from_fd=%d to_fd=%d frame_len=%u", from_fd, to_fd, len);
 	int rc = net_send_frame(to_fd, buf, len);
 	net_free_frame(buf);
 	return rc;
@@ -122,6 +125,15 @@ static int decrypt_frame(const uint8_t key[32], const uint8_t *frame, uint32_t f
 	uint8_t aad[1 + 8];
 	aad[0] = *out_type;
 	u64_be_store(&aad[1], *out_seq);
+	logger_log("mitm decrypt frame: type=0x%02x seq=%llu ciphertext_len=%u", *out_type,
+			   (unsigned long long)*out_seq, *out_ct_len);
+	logger_hex("mitm decrypt iv", *out_iv, 12);
+	logger_hex("mitm decrypt aad", aad, sizeof(aad));
+	logger_hex("mitm decrypt tag", *out_tag, 16);
+	if (*out_ct_len > 0) {
+		logger_hex("mitm decrypt ciphertext", *out_ct, *out_ct_len);
+	}
+	logger_hex("mitm decrypt key", key, 32);
 
 	if (*out_ct_len > 0) {
 		*out_pt = (uint8_t *)malloc(*out_ct_len);
@@ -137,6 +149,9 @@ static int decrypt_frame(const uint8_t key[32], const uint8_t *frame, uint32_t f
 		*out_pt = NULL;
 		return -1;
 	}
+	if (*out_ct_len > 0) {
+		logger_hex("mitm decrypted plaintext", *out_pt, *out_ct_len);
+	}
 
 	return 0;
 }
@@ -146,6 +161,13 @@ static int encrypt_frame(const uint8_t key[32], uint8_t type, uint64_t seq, cons
 	uint8_t aad[1 + 8];
 	aad[0] = type;
 	u64_be_store(&aad[1], seq);
+	logger_log("mitm encrypt frame: type=0x%02x seq=%llu plaintext_len=%u", type, (unsigned long long)seq, pt_len);
+	logger_hex("mitm encrypt iv", iv, 12);
+	logger_hex("mitm encrypt aad", aad, sizeof(aad));
+	logger_hex("mitm encrypt key", key, 32);
+	if (pt_len > 0) {
+		logger_hex("mitm encrypt plaintext", pt, pt_len);
+	}
 
 	uint8_t *ct = NULL;
 	if (pt_len > 0) {
@@ -160,6 +182,10 @@ static int encrypt_frame(const uint8_t key[32], uint8_t type, uint64_t seq, cons
 		free(ct);
 		return -1;
 	}
+	if (pt_len > 0) {
+		logger_hex("mitm encrypt ciphertext", ct, pt_len);
+	}
+	logger_hex("mitm encrypt tag", tag, sizeof(tag));
 
 	uint32_t frame_len = 1 + 8 + 12 + 16 + pt_len;
 	uint8_t *frame = (uint8_t *)malloc(frame_len);
@@ -190,9 +216,12 @@ static int handle_ctrl_client_to_server(struct mitm_ctx *ctx, uint8_t *pt, uint3
 	if (pt_len != (1 + 16 + 32) || pt[0] != CTRL_REKEY_INIT) {
 		return 0;
 	}
+	logger_log("intercepted client->server rekey init");
 
 	memcpy(ctx->pending.n_c, &pt[1], 16);
 	memcpy(ctx->pending.pub_c, &pt[1 + 16], 32);
+	logger_hex("client rekey nonce", ctx->pending.n_c, 16);
+	logger_hex("client rekey public key", ctx->pending.pub_c, 32);
 
 	if (crypto_dh_keypair(ctx->pending.priv_to_server, ctx->pending.pub_to_server) != 0) {
 		return -1;
@@ -201,8 +230,13 @@ static int handle_ctrl_client_to_server(struct mitm_ctx *ctx, uint8_t *pt, uint3
 		return -1;
 	}
 	ctx->pending.active = 1;
+	logger_hex("mitm rekey priv->server", ctx->pending.priv_to_server, 32);
+	logger_hex("mitm rekey pub->server", ctx->pending.pub_to_server, 32);
+	logger_hex("mitm rekey priv->client", ctx->pending.priv_to_client, 32);
+	logger_hex("mitm rekey pub->client", ctx->pending.pub_to_client, 32);
 
 	memcpy(&pt[1 + 16], ctx->pending.pub_to_server, 32);
+	logger_log("replaced client rekey public key before forwarding to server");
 	return 0;
 }
 
@@ -213,21 +247,28 @@ static int handle_ctrl_server_to_client(struct mitm_ctx *ctx, uint8_t *pt, uint3
 	if (!ctx->pending.active) {
 		return -1;
 	}
+	logger_log("intercepted server->client rekey reply");
 
 	uint8_t n_s2[16];
 	uint8_t pub_s2[32];
 	memcpy(n_s2, &pt[1], 16);
 	memcpy(pub_s2, &pt[1 + 16], 32);
+	logger_hex("server rekey nonce", n_s2, 16);
+	logger_hex("server rekey public key", pub_s2, 32);
 
 	uint8_t shared_server[32];
 	uint8_t shared_client[32];
 	crypto_dh_shared(shared_server, ctx->pending.priv_to_server, pub_s2);
 	crypto_dh_shared(shared_client, ctx->pending.priv_to_client, ctx->pending.pub_c);
+	logger_hex("mitm shared with server", shared_server, 32);
+	logger_hex("mitm shared with client", shared_client, 32);
 
 	uint8_t new_key_server[32];
 	uint8_t new_key_client[32];
 	kdf_key(new_key_server, shared_server, ctx->pending.n_c, n_s2);
 	kdf_key(new_key_client, shared_client, ctx->pending.n_c, n_s2);
+	logger_hex("next key for server side", new_key_server, 32);
+	logger_hex("next key for client side", new_key_client, 32);
 
 	memcpy(ctx->next_key_server, new_key_server, 32);
 	memcpy(ctx->next_key_client, new_key_client, 32);
@@ -235,6 +276,7 @@ static int handle_ctrl_server_to_client(struct mitm_ctx *ctx, uint8_t *pt, uint3
 	ctx->switch_pending = 1;
 
 	memcpy(&pt[1 + 16], ctx->pending.pub_to_client, 32);
+	logger_log("replaced server rekey public key before forwarding to client");
 	ctx->pending.active = 0;
 	return 0;
 }
@@ -266,6 +308,7 @@ static int relay_one(struct mitm_ctx *ctx, int from_fd, int to_fd, const uint8_t
 	}
 
 	if (type == MSG_CTRL) {
+		logger_log("relay_one saw control frame direction=%s", is_c2s ? "C->S" : "S->C");
 		if (is_c2s) {
 			if (handle_ctrl_client_to_server(ctx, pt, ct_len) != 0) {
 				free(pt);
@@ -297,10 +340,13 @@ static int relay_one(struct mitm_ctx *ctx, int from_fd, int to_fd, const uint8_t
 	int rc = net_send_frame(to_fd, out_frame, out_len);
 	free(out_frame);
 	if (rc == 0 && should_switch) {
+		logger_log("switching MITM active keys after successful rekey forward");
 		memcpy(ctx->key_server, ctx->next_key_server, 32);
 		memcpy(ctx->key_client, ctx->next_key_client, 32);
 		ctx->salt = ctx->next_salt;
 		ctx->switch_pending = 0;
+		logger_hex("active key toward server", ctx->key_server, 32);
+		logger_hex("active key toward client", ctx->key_client, 32);
 	}
 	return rc;
 }
@@ -313,6 +359,7 @@ enum mode {
 };
 
 static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum mode mode) {
+	logger_log("MITM handshake start: client_fd=%d server_fd=%d mode=%d", client_fd, server_fd, mode);
 	void *cbuf = NULL;
 	uint32_t clen = 0;
 	if (net_recv_frame(client_fd, &cbuf, &clen) != 0) {
@@ -330,6 +377,8 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum
 	memcpy(ctx->n_c, &cp[1], 16);
 	uint8_t pub_c[32];
 	memcpy(pub_c, &cp[1 + 16], 32);
+	logger_hex("client hello nonce", ctx->n_c, 16);
+	logger_hex("original client public key", pub_c, 32);
 
 	uint8_t priv_to_server[32];
 	uint8_t pub_to_server[32];
@@ -346,11 +395,16 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum
 			return -1;
 		}
 		have_mitm_keys = 1;
+		logger_hex("mitm priv toward server", priv_to_server, 32);
+		logger_hex("mitm pub toward server", pub_to_server, 32);
+		logger_hex("mitm priv toward client", priv_to_client, 32);
+		logger_hex("mitm pub toward client", pub_to_client, 32);
 	}
 
 	cp[0] = MSG_CLIENT_HELLO;
 	if (have_mitm_keys && (mode == MODE_AUTO || mode == MODE_STAGE1 || mode == MODE_STAGE3_ATTACK)) {
 		memcpy(&cp[1 + 16], pub_to_server, 32);
+		logger_log("replaced client hello public key before forwarding");
 	}
 	if (net_send_frame(server_fd, cp, clen) != 0) {
 		net_free_frame(cbuf);
@@ -376,6 +430,9 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum
 		}
 		memcpy(ctx->n_s, &sp[1], 16);
 		ctx->raw_forward = 1;
+		logger_hex("server hello nonce", ctx->n_s, 16);
+		logger_hex("server hello ephemeral public key", &sp[1 + 16], 32);
+		logger_hex("server hello static public key", &sp[1 + 16 + 32], 32);
 
 		if (mode == MODE_STAGE3_ATTACK || mode == MODE_AUTO) {
 			if (!have_mitm_keys) {
@@ -385,6 +442,8 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum
 			memcpy(&sp[1 + 16], pub_to_client, 32);
 			fprintf(stdout, "stage3 attack injected\n");
 			fflush(stdout);
+			logger_log("stage3 attack injected: replaced authenticated ephemeral public key");
+			logger_hex("forged public key toward client", pub_to_client, 32);
 		}
 
 		if (net_send_frame(client_fd, sp, slen) != 0) {
@@ -408,9 +467,12 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum
 	memcpy(ctx->n_s, &sp[1], 16);
 	uint8_t pub_s[32];
 	memcpy(pub_s, &sp[1 + 16], 32);
+	logger_hex("server hello nonce", ctx->n_s, 16);
+	logger_hex("original server public key", pub_s, 32);
 
 	sp[0] = MSG_SERVER_HELLO;
 	memcpy(&sp[1 + 16], pub_to_client, 32);
+	logger_log("replaced server hello public key before forwarding");
 	if (net_send_frame(client_fd, sp, slen) != 0) {
 		net_free_frame(sbuf);
 		return -1;
@@ -423,7 +485,12 @@ static int do_handshake(struct mitm_ctx *ctx, int client_fd, int server_fd, enum
 	crypto_dh_shared(shared_server, priv_to_server, pub_s);
 	kdf_key(ctx->key_client, shared_client, ctx->n_c, ctx->n_s);
 	kdf_key(ctx->key_server, shared_server, ctx->n_c, ctx->n_s);
+	logger_hex("shared secret with client", shared_client, 32);
+	logger_hex("shared secret with server", shared_server, 32);
+	logger_hex("active key toward client", ctx->key_client, 32);
+	logger_hex("active key toward server", ctx->key_server, 32);
 	ctx->salt = derive_salt(ctx->n_c, ctx->n_s);
+	logger_log("MITM handshake success: salt=0x%08x", ctx->salt);
 	ctx->pending.active = 0;
 	return 0;
 }
@@ -439,6 +506,7 @@ int main(int argc, char **argv) {
 	uint16_t listen_port = 9001;
 	const char *target_host = "127.0.0.1";
 	uint16_t target_port = 9000;
+	const char *log_file = "mitm_protocol.log";
 	enum mode mode = MODE_AUTO;
 
 	static struct option opts[] = {
@@ -447,11 +515,12 @@ int main(int argc, char **argv) {
 		{"target", required_argument, 0, 't'},
 		{"tport", required_argument, 0, 'T'},
 		{"mode", required_argument, 0, 'm'},
+		{"log-file", required_argument, 0, 'f'},
 		{0, 0, 0, 0},
 	};
 
 	for (;;) {
-		int c = getopt_long(argc, argv, "l:L:t:T:m:", opts, NULL);
+		int c = getopt_long(argc, argv, "l:L:t:T:m:f:", opts, NULL);
 		if (c == -1) {
 			break;
 		}
@@ -488,6 +557,9 @@ int main(int argc, char **argv) {
 				return 2;
 			}
 			break;
+		case 'f':
+			log_file = optarg;
+			break;
 		default:
 			usage(argv[0]);
 			return 2;
@@ -495,27 +567,41 @@ int main(int argc, char **argv) {
 	}
 
 	signal(SIGPIPE, SIG_IGN);
+	if (logger_init(log_file, "stage2-mitm") != 0) {
+		fprintf(stderr, "Failed to open log file: %s\n", log_file);
+		return 1;
+	}
+	logger_log("mitm process start: listen=%s:%u target=%s:%u mode=%d", listen_host, listen_port, target_host,
+			   target_port, mode);
 
 	int listen_fd = net_listen_tcp(listen_host, listen_port, 128);
 	if (listen_fd < 0) {
 		perror("listen");
+		logger_log("listen failed");
+		logger_close();
 		return 1;
 	}
+	logger_log("listen success: fd=%d", listen_fd);
 
 	for (;;) {
 		int client_fd = net_accept(listen_fd);
 		if (client_fd < 0) {
+			logger_log("accept failed, retrying");
 			continue;
 		}
+		logger_log("accepted client connection: fd=%d", client_fd);
 		int server_fd = net_connect_tcp(target_host, target_port);
 		if (server_fd < 0) {
+			logger_log("connect to target failed");
 			close(client_fd);
 			continue;
 		}
+		logger_log("connected to target server: fd=%d", server_fd);
 
 		struct mitm_ctx ctx;
 		memset(&ctx, 0, sizeof(ctx));
 		if (do_handshake(&ctx, client_fd, server_fd, mode) != 0) {
+			logger_log("MITM handshake failed");
 			close(client_fd);
 			close(server_fd);
 			continue;
@@ -533,6 +619,7 @@ int main(int argc, char **argv) {
 				break;
 			}
 			if (pfds[0].revents & POLLIN) {
+				logger_log("poll event: client side readable");
 				if (ctx.raw_forward) {
 					if (relay_raw_one(client_fd, server_fd) != 0) {
 						break;
@@ -544,6 +631,7 @@ int main(int argc, char **argv) {
 				}
 			}
 			if (pfds[1].revents & POLLIN) {
+				logger_log("poll event: server side readable");
 				if (ctx.raw_forward) {
 					if (relay_raw_one(server_fd, client_fd) != 0) {
 						break;
@@ -558,6 +646,7 @@ int main(int argc, char **argv) {
 
 		close(client_fd);
 		close(server_fd);
+		logger_log("session closed");
 	}
 
 	return 0;

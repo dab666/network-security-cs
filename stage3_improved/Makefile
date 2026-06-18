@@ -11,7 +11,7 @@ SERVER := $(BIN_DIR)/server
 CLIENT := $(BIN_DIR)/client
 KEYGEN := $(BIN_DIR)/keygen
 
-COMMON_OBJS := $(OBJ_DIR)/net.o $(OBJ_DIR)/util.o $(OBJ_DIR)/crypto_sha256.o $(OBJ_DIR)/crypto_aes256.o $(OBJ_DIR)/crypto_gcm.o $(OBJ_DIR)/crypto_dh.o $(OBJ_DIR)/sc.o
+COMMON_OBJS := $(OBJ_DIR)/net.o $(OBJ_DIR)/util.o $(OBJ_DIR)/logger.o $(OBJ_DIR)/crypto_sha256.o $(OBJ_DIR)/crypto_aes256.o $(OBJ_DIR)/crypto_gcm.o $(OBJ_DIR)/crypto_dh.o $(OBJ_DIR)/sc.o
 
 all: $(SERVER) $(CLIENT) $(KEYGEN)
 
@@ -30,7 +30,7 @@ $(SERVER): $(SRC_DIR)/server.c $(COMMON_OBJS) | $(BIN_DIR)
 $(CLIENT): $(SRC_DIR)/client.c $(COMMON_OBJS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) $^ -o $@ -pthread $(LDFLAGS)
 
-$(KEYGEN): $(SRC_DIR)/keygen.c $(OBJ_DIR)/util.o $(OBJ_DIR)/crypto_dh.o | $(BIN_DIR)
+$(KEYGEN): $(SRC_DIR)/keygen.c $(OBJ_DIR)/util.o $(OBJ_DIR)/logger.o $(OBJ_DIR)/crypto_dh.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) $^ -o $@ $(LDFLAGS)
 
 clean:
